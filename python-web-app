@@ -1,0 +1,108 @@
+import time
+import logging
+import requests
+import json
+from datadog import initialize, statsd
+
+# Setup logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Console handler (existing)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s"
+))
+logger.addHandler(console_handler)
+
+# Custom Datadog HTTP Log Handler
+class DatadogHTTPLogHandler(logging.Handler):
+    def __init__(self, api_key, service="catfact-service", source="python", tags=None):
+        super().__init__()
+        self.api_key = api_key
+        self.service = service
+        self.source = source
+        self.tags = tags or []
+        # Using US5 endpoint since your Datadog site is us5.datadoghq.com
+        self.url = "https://http-intake.logs.us5.datadoghq.com/v1/input/" + api_key
+
+    def emit(self, record):
+        try:
+            log_entry = {
+                "timestamp": int(record.created * 1000),  # Convert to milliseconds
+                "level": record.levelname,
+                "message": record.getMessage(),
+                "service": self.service,
+                "source": self.source,
+                "tags": ",".join(self.tags),
+                "logger": record.name,
+            }
+            
+            # Add extra fields if present
+            if hasattr(record, 'fact_length'):
+                log_entry['fact_length'] = record.fact_length
+            if hasattr(record, 'response_status'):
+                log_entry['response_status'] = record.response_status
+            if hasattr(record, 'error_type'):
+                log_entry['error_type'] = record.error_type
+
+            response = requests.post(
+                self.url,
+                json=log_entry,
+                headers={"Content-Type": "application/json"},
+                timeout=5
+            )
+            
+            # Debug: Print response status
+            if response.status_code != 200:
+                print(f"Datadog log upload failed: {response.status_code} - {response.text}")
+            else:
+                print(f"Log sent successfully to Datadog: {response.status_code}")
+                
+        except Exception as e:
+            # Print the error for debugging
+            print(f"Error sending log to Datadog: {e}")
+            pass
+
+# Add Datadog HTTP handler
+datadog_handler = DatadogHTTPLogHandler(
+    api_key="971437406d3b6d4169dbbb962f983d85",
+    service="catfact-service",
+    source="python",
+    tags=["env:production", "app:catfacts"]
+)
+logger.addHandler(datadog_handler)
+
+# Initialize Datadog for metrics
+initialize(
+    api_key="971437406d3b6d4169dbbb962f983d85",
+    statsd_host="127.0.0.1", 
+    statsd_port=8125
+)
+
+def fetch_cat_fact():
+    while True:
+        try:
+            logger.info("Fetching cat fact from API...")
+            statsd.increment("catfact.request.count", tags=["action:attempt"])
+
+            response = requests.get("https://catfact.ninja/fact", timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            fact = data.get("fact", "No fact returned")
+
+            logger.info(f"Fetched cat fact: {fact}", extra={
+                "fact_length": len(fact),
+                "response_status": response.status_code
+            })
+            statsd.increment("catfact.request.count", tags=["action:success"])
+        except Exception as e:
+            logger.error(f"Failed to fetch cat fact: {str(e)}", extra={
+                "error_type": type(e).__name__
+            })
+            statsd.increment("catfact.request.count", tags=["action:failed"])
+
+        time.sleep(180)  # Sleep for 3 minutes
+
+if __name__ == "__main__":
+    fetch_cat_fact()
